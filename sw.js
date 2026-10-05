@@ -1,6 +1,6 @@
 // Inkbook service worker — makes the app open offline.
 // When you change index.html or other files, raise this number (v2, v3 ...)
-const VERSION = 'inkbook-v1';
+const VERSION = 'inkbook-v2';
 
 const CORE = [
   './',
@@ -22,6 +22,7 @@ self.addEventListener('install', (event) => {
   event.waitUntil((async () => {
     const cache = await caches.open(VERSION);
     await cache.addAll(CORE);
+    try { const f = await fetch('./Utsaah.ttf'); if (f.ok) await cache.put('./Utsaah.ttf', f); } catch (e) {}
     await Promise.all(CDN.map(async (url) => {
       try {
         const res = await fetch(url, { mode: 'cors' });

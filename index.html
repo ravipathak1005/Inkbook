@@ -15,6 +15,7 @@
 <script defer crossorigin="anonymous" src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
 <script defer crossorigin="anonymous" src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
 <style>
+@font-face{font-family:"InkHindi";src:url("Utsaah.ttf") format("truetype");font-display:swap}
 :root{
   --desk:#E9ECF1; --chrome:#FFFFFF; --ink:#1E2B4A; --muted:#66708A; --line:#D7DCE5;
   --blue:#2A4BD7; --mark:#F6D64A; --danger:#C93A3A; --card:#FFFFFF;
@@ -106,6 +107,9 @@ body.penonly .page{touch-action:pan-x pan-y}
 .modal p{margin:0 0 14px;color:var(--muted)}
 .modal input[type=text]{width:100%;height:46px;border-radius:10px;border:1px solid var(--line);background:var(--desk);color:var(--ink);
   font:inherit;font-size:16px;padding:0 12px;-webkit-user-select:text;user-select:text}
+.modal textarea{width:100%;min-height:220px;border-radius:10px;border:1px solid var(--line);background:var(--desk);color:var(--ink);
+  font:19px/1.55 "InkHindi","Noto Sans Devanagari","Kohinoor Devanagari","Nirmala UI",sans-serif;padding:10px 12px;-webkit-user-select:text;user-select:text;resize:vertical}
+.note{font-size:13px;color:var(--muted);margin:6px 0 0}
 .field{margin:0 0 16px}
 .field label{display:block;font-size:13px;font-weight:600;color:var(--muted);margin-bottom:6px}
 .seg{display:flex;flex-wrap:wrap;gap:6px}
@@ -179,6 +183,7 @@ body.penonly .page{touch-action:pan-x pan-y}
     <button class="tool" id="zoomIn" aria-label="Zoom in"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3M8 11h6M11 8v6"/></svg></button>
     <div class="sep"></div>
     <button class="tool" id="btnAddPage" aria-label="Add page"><svg viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 00-2 2v14a2 2 0 002 2h12a2 2 0 002-2V9z"/><path d="M14 3v6h6"/><path d="M12 12v6M9 15h6"/></svg></button>
+    <button class="tool" id="btnConvert" aria-label="Convert handwriting to text"><svg viewBox="0 0 24 24"><path d="M4 7V5h12v2M10 5v14M7.5 19h5"/><path d="M15 15l2.5 2.5L22 12"/></svg></button>
   </div>
   <div id="scroller"><div id="pages"></div></div>
   <div id="pageInd">1 / 1</div>
@@ -209,10 +214,10 @@ const SIZES = { pen: [1.1, 2, 3.4], hl: [9, 15, 22], eraser: [5, 11, 22] };
 const ZMIN = 0.5, ZMAX = 4;
 
 /* ---------------- Settings (small, per device) ---------------- */
-const DEFAULT_SET = { penOnly: false, autoPen: true, color: { pen: COLORS.pen[0], hl: COLORS.hl[0] }, size: { pen: 1, hl: 1, eraser: 1 }, tool: 'pen', hideInstall: false };
+const DEFAULT_SET = { penOnly: false, autoPen: true, color: { pen: COLORS.pen[0], hl: COLORS.hl[0] }, size: { pen: 1, hl: 1, eraser: 1 }, tool: 'pen', hideInstall: false, ocr: { key: 'helloworld', lang: 'auto', engine: 3 } };
 function loadSet() {
   try { const s = JSON.parse(localStorage.getItem('inkbook.settings') || '{}');
-    return Object.assign({}, DEFAULT_SET, s, { color: Object.assign({}, DEFAULT_SET.color, s.color), size: Object.assign({}, DEFAULT_SET.size, s.size) });
+    return Object.assign({}, DEFAULT_SET, s, { color: Object.assign({}, DEFAULT_SET.color, s.color), size: Object.assign({}, DEFAULT_SET.size, s.size), ocr: Object.assign({}, DEFAULT_SET.ocr, s.ocr) });
   } catch (e) { return JSON.parse(JSON.stringify(DEFAULT_SET)); }
 }
 function saveSet() { try { localStorage.setItem('inkbook.settings', JSON.stringify(S.set)); } catch (e) {} }
@@ -271,7 +276,7 @@ function queue(fn) {
   S.q = S.q.then(fn).catch(err => { console.error(err); toast('Could not save: ' + ((err && err.name) || 'error') + '. Device storage may be full.'); });
   return S.q;
 }
-function pageRecord(p) { return { id: p.id, nb: p.nb, w: p.w, h: p.h, bg: p.bg, strokes: p.strokes }; }
+function pageRecord(p) { return { id: p.id, nb: p.nb, w: p.w, h: p.h, bg: p.bg, strokes: p.strokes, typed: p.typed || [] }; }
 function savePage(p) { queue(() => DB.put('pages', pageRecord(p))); touchNb(); }
 let nbTimer = 0;
 function touchNb() {
@@ -397,6 +402,59 @@ function drawTemplate(ctx, p, r) {
   }
 }
 
+/* ---------------- Typed text (from handwriting conversion) ----------------
+   Flows from the top-left like a document, one fixed size, wraps at the right margin. */
+const TYPE_SIZE = 16;
+const TYPE_FONT = '"InkHindi","Noto Sans Devanagari","Kohinoor Devanagari","Nirmala UI",sans-serif';
+const TYPE_COLOR = '#1B1F2A';
+const mctx = document.createElement('canvas').getContext('2d');
+let fontP = null;
+function fontReady() {
+  if (!fontP) fontP = (document.fonts && document.fonts.load) ? document.fonts.load(TYPE_SIZE + 'px InkHindi', 'कखग abc').catch(() => {}) : Promise.resolve();
+  return fontP;
+}
+function typedMetrics(p) {
+  const lined = p.bg.t === 'tpl' && p.bg.tpl === 'lined';
+  return lined ? { x: 66, right: p.w - 30, first: 66, lh: 26, bottom: p.h - 36 }    // sits on the ruled lines (72, 98, ...)
+               : { x: 40, right: p.w - 40, first: 56, lh: 24, bottom: p.h - 40 };
+}
+function wrapPara(text, maxW) {
+  if (!text.trim()) return [''];
+  const lines = []; let line = '';
+  for (let w of text.split(/\s+/).filter(Boolean)) {
+    const t = line ? line + ' ' + w : w;
+    if (mctx.measureText(t).width <= maxW) { line = t; continue; }
+    if (line) lines.push(line);
+    let ch = [...w];
+    while (ch.length > 1 && mctx.measureText(ch.join('')).width > maxW) {
+      let k = ch.length; while (k > 1 && mctx.measureText(ch.slice(0, k).join('')).width > maxW) k--;
+      lines.push(ch.slice(0, k).join('')); ch = ch.slice(k);
+    }
+    line = ch.join('');
+  }
+  if (line) lines.push(line);
+  return lines;
+}
+function layoutTyped(p, paras) {
+  mctx.font = TYPE_SIZE + 'px ' + TYPE_FONT;
+  const m = typedMetrics(p), lines = [];
+  paras.forEach((t, pi) => wrapPara(t, m.right - m.x).forEach(l => lines.push({ t: l, pi })));
+  const cap = Math.max(1, Math.floor((m.bottom - m.first) / m.lh) + 1);
+  return { m, fit: lines.slice(0, cap), rest: lines.slice(cap) };
+}
+function linesToParas(lines) {
+  const out = []; let last = null;
+  for (const l of lines) { if (l.pi === last) out[out.length - 1] += ' ' + l.t; else out.push(l.t); last = l.pi; }
+  return out;
+}
+function drawTyped(ctx, p, r) {
+  if (!p.typed || !p.typed.length) return;
+  const { m, fit } = layoutTyped(p, p.typed);
+  ctx.setTransform(r, 0, 0, r, 0, 0);
+  ctx.font = TYPE_SIZE + 'px ' + TYPE_FONT; ctx.fillStyle = TYPE_COLOR; ctx.textBaseline = 'alphabetic';
+  fit.forEach((l, i) => { if (l.t) ctx.fillText(l.t, m.x, m.first + i * m.lh); });
+}
+
 /* ---------------- Strokes ---------------- */
 // stroke = { tool:'pen'|'hl', color, size, pts:[x,y,pressure, x,y,pressure, ...] } in page points
 const segW = (st, pr) => st.tool === 'hl' ? st.size : st.size * (0.45 + pr * 1.1);
@@ -517,6 +575,7 @@ async function renderPage(p) {
     if (!p._bg) { p._bg = document.createElement('canvas'); p._el.insertBefore(p._bg, p._ink); }
     p._bg.width = W; p._bg.height = H;
     drawTemplate(p._bg.getContext('2d'), p, r);
+    drawTyped(p._bg.getContext('2d'), p, r);
     return;
   }
   if (!S.pdfDoc) {
@@ -721,6 +780,22 @@ function updUndo() { $('#btnUndo').disabled = !S.undo.length; $('#btnRedo').disa
 function pushUndo(op) { S.undo.push(op); if (S.undo.length > 300) S.undo.shift(); S.redo = []; updUndo(); }
 function applyOp(op, back) {
   const p = S.pages.find(q => q.id === op.pid); if (!p) return;
+  if (op.t === 'page') {
+    const st = back ? op.before : op.after;
+    p.strokes = st.strokes.slice(); p.typed = st.typed.slice();
+    if (back) {
+      const ids = new Set(op.added.map(a => a.id));
+      S.pages = S.pages.filter(q => !ids.has(q.id));
+      op.added.forEach(a => queue(() => DB.del('pages', a.id)));
+    } else if (op.added.length) {
+      S.pages.splice(S.pages.indexOf(p) + 1, 0, ...op.added);
+      op.added.forEach(a => queue(() => DB.put('pages', pageRecord(a))));
+    }
+    S.nb.pageIds = S.pages.map(q => q.id);
+    savePage(p); queue(() => DB.put('notebooks', S.nb));
+    const keep = scroller.scrollTop; buildPages(); scroller.scrollTop = keep; updateVisible();
+    return;
+  }
   if (op.t === 'add') {
     if (back) { const i = p.strokes.lastIndexOf(op.st); if (i >= 0) p.strokes.splice(i, 1); }
     else p.strokes.push(op.st);
@@ -798,6 +873,9 @@ $('#btnMenu').onclick = () => {
     { label: 'Insert page after this one', on: () => addPageAfter(idx) }
   ];
   if (p && p.bg.t === 'tpl') items.push({ label: 'Change page background', on: () => chooseBackground(idx) });
+  items.push({ label: 'Convert handwriting to text', on: convertPage });
+  if (p && p.typed && p.typed.length) items.push({ label: 'Edit typed text on this page', on: () => editTyped(p) });
+  items.push({ label: 'Text recognition settings', on: ocrSettings });
   items.push(
     { label: 'Export as PDF', on: exportPdf },
     { label: 'Back up this notebook', on: () => backup([S.nb.id]) },
@@ -811,6 +889,153 @@ async function renameCurrent() {
   if (!t) return;
   S.nb.title = t; $('#nbTitle').textContent = t; touchNb(); queue(() => DB.put('notebooks', S.nb));
 }
+
+/* ---------------- Handwriting → text (OCR.space) ---------------- */
+const OCR_URL = 'https://api.ocr.space/parse/image';
+function inkImage(strokes) {
+  let b = [Infinity, Infinity, -Infinity, -Infinity];
+  for (const st of strokes) { const q = bbox(st), pad = st.size; b = [Math.min(b[0], q[0] - pad), Math.min(b[1], q[1] - pad), Math.max(b[2], q[2] + pad), Math.max(b[3], q[3] + pad)]; }
+  const P = 24; b = [b[0] - P, b[1] - P, b[2] + P, b[3] + P];
+  const bw = b[2] - b[0], bh = b[3] - b[1];
+  let sc = Math.min(2.5, 2000 / Math.max(bw, bh)), url = '';
+  for (let tries = 0; tries < 5; tries++) {
+    const c = document.createElement('canvas');
+    c.width = Math.max(1, Math.round(bw * sc)); c.height = Math.max(1, Math.round(bh * sc));
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
+    ctx.setTransform(sc, 0, 0, sc, -b[0] * sc, -b[1] * sc);
+    for (const st of strokes) drawStroke(ctx, Object.assign({}, st, { color: '#000', size: Math.max(st.size, 1.6) }));
+    url = c.toDataURL('image/jpeg', 0.85); c.width = c.height = 0;
+    if (url.length * 0.75 < 900000) break;     // free plan: 1 MB per image
+    sc *= 0.75;
+  }
+  return url;
+}
+function ocrError(j) {
+  const m = j && (Array.isArray(j.ErrorMessage) ? j.ErrorMessage.join(' ') : j.ErrorMessage);
+  return 'OCR.space could not read this page' + (m ? ': ' + m : '.');
+}
+async function ocrSpace(img) {
+  const o = S.set.ocr;
+  const run = async engine => {
+    const fd = new FormData();
+    fd.append('apikey', (o.key || 'helloworld').trim());
+    fd.append('base64Image', img);
+    fd.append('language', o.lang);
+    fd.append('OCREngine', String(engine));
+    fd.append('scale', 'true');
+    fd.append('isOverlayRequired', 'false');
+    let r;
+    try { r = await fetch(OCR_URL, { method: 'POST', body: fd }); }
+    catch (e) { throw new Error('Could not reach OCR.space. Check your internet connection.'); }
+    const raw = await r.text();
+    let j; try { j = JSON.parse(raw); } catch (e) { throw new Error(raw.length < 200 && raw ? 'OCR.space: ' + raw : 'OCR.space returned an error (' + r.status + '). Try again in a few minutes.'); }
+    if (j.IsErroredOnProcessing || !j.ParsedResults) throw new Error(ocrError(j));
+    return j.ParsedResults.map(x => x.ParsedText || '').join('\n');
+  };
+  try { return await run(o.engine); }
+  catch (e) { if (+o.engine !== 2 && !/internet/.test(e.message)) { try { return await run(2); } catch (e2) {} } throw e; }
+}
+async function convertPage() {
+  const idx = S.cur, p = S.pages[idx]; if (!p) return;
+  const pen = p.strokes.filter(st => st.tool === 'pen');
+  if (!pen.length) return toast('There is no handwriting on page ' + (idx + 1) + ' to convert.');
+  if (navigator.onLine === false) return toast('Converting needs internet. Your handwriting is safe; try again when you are online.');
+  busy('Reading handwriting…');
+  let text;
+  try { text = await ocrSpace(inkImage(pen)); }
+  catch (e) { busy(); return toast(e.message); }
+  busy();
+  text = text.replace(/\r\n?/g, '\n').replace(/[ \t]+\n/g, '\n').trim();
+  if (!text) return toast('No text could be read. Try writing a little larger, or change the language in Text recognition settings.');
+  const canReplace = p.bg.t === 'tpl';
+  modal(`<h3>Check the text</h3><textarea spellcheck="false"></textarea>` +
+    `<p class="note">${canReplace ? 'Replacing removes all handwriting on page ' + (idx + 1) + ' and types this text from the top of the page. Undo brings the handwriting back.' : 'This is a PDF page, so the text can be copied but not typed onto the page.'}</p>` +
+    `<div class="row" style="margin-top:14px"><button class="btn" data-a="cancel">Cancel</button><button class="btn" data-a="copy">Copy</button>` +
+    (canReplace ? `<button class="btn primary" data-a="replace">Replace with text</button>` : '') + '</div>',
+    (m, close) => {
+      const ta = m.querySelector('textarea'); ta.value = text;
+      m.addEventListener('click', async e => {
+        const b = e.target.closest('[data-a]'); if (!b) return;
+        if (b.dataset.a === 'cancel') return close();
+        if (b.dataset.a === 'copy') {
+          try { await navigator.clipboard.writeText(ta.value); toast('Text copied'); }
+          catch (err) { ta.focus(); ta.select(); toast('Select the text and copy it manually.'); }
+          return;
+        }
+        const paras = ta.value.replace(/\r\n?/g, '\n').split('\n').map(x => x.replace(/\s+$/, ''));
+        while (paras.length && !paras[0].trim()) paras.shift();
+        while (paras.length && !paras[paras.length - 1].trim()) paras.pop();
+        if (!paras.length) return toast('The text box is empty.');
+        close();
+        await setPageContent(p, p.strokes.filter(st => st.tool !== 'pen'), (p.typed || []).concat(paras), 'Handwriting replaced with text');
+      });
+    });
+}
+async function setPageContent(p, strokes, paras, msg) {
+  await fontReady();
+  const before = { strokes: p.strokes.slice(), typed: (p.typed || []).slice() };
+  const tpl = p.bg.t === 'tpl' ? p.bg.tpl : 'lined';
+  const added = [];
+  p.strokes = strokes;
+  let page = p, rest = paras;
+  for (;;) {
+    const L = layoutTyped(page, rest);
+    if (!L.rest.length || added.length >= 40) { page.typed = rest; break; }
+    page.typed = linesToParas(L.fit);
+    rest = linesToParas(L.rest);
+    const np = { id: uid(), nb: S.nb.id, w: p.w, h: p.h, bg: { t: 'tpl', tpl }, strokes: [], typed: [] };
+    added.push(np); page = np;
+  }
+  S.pages.splice(S.pages.indexOf(p) + 1, 0, ...added);
+  S.nb.pageIds = S.pages.map(q => q.id);
+  savePage(p);
+  added.forEach(a => queue(() => DB.put('pages', pageRecord(a))));
+  queue(() => DB.put('notebooks', S.nb));
+  pushUndo({ t: 'page', pid: p.id, before, after: { strokes: p.strokes.slice(), typed: p.typed.slice() }, added });
+  buildPages(); scroller.scrollTop = p._el.offsetTop - 12; updateVisible();
+  toast(msg + (added.length ? ` (continues on ${added.length} new page${added.length > 1 ? 's' : ''})` : ''));
+}
+function editTyped(p) {
+  modal(`<h3>Edit typed text</h3><textarea spellcheck="false"></textarea>` +
+    `<div class="row" style="margin-top:14px"><button class="btn" data-a="0">Cancel</button><button class="btn primary" data-a="1">Save text</button></div>`,
+    (m, close) => {
+      const ta = m.querySelector('textarea'); ta.value = p.typed.join('\n');
+      m.addEventListener('click', async e => {
+        const b = e.target.closest('[data-a]'); if (!b) return;
+        close(); if (b.dataset.a !== '1') return;
+        const paras = ta.value.replace(/\r\n?/g, '\n').split('\n').map(x => x.replace(/\s+$/, ''));
+        while (paras.length && !paras[paras.length - 1].trim()) paras.pop();
+        await setPageContent(p, p.strokes.slice(), paras, 'Text saved');
+      });
+    });
+}
+function ocrSettings() {
+  const o = Object.assign({}, S.set.ocr);
+  const seg = (id, opts, val) => `<div class="seg" id="${id}">` + opts.map(([v, l]) => `<button data-v="${v}" class="${String(v) === String(val) ? 'on' : ''}">${l}</button>`).join('') + '</div>';
+  modal(`<h3>Text recognition</h3>
+    <div class="field"><label>Service</label><div>OCR.space</div></div>
+    <div class="field"><label>API key</label><input type="text" id="ocrKey" value="${esc(o.key)}" autocomplete="off" autocapitalize="off" spellcheck="false">
+      <p class="note">"helloworld" is OCR.space's public test key, with strict limits. For regular use, get your own free key from ocr.space by email and paste it here.</p></div>
+    <div class="field"><label>Language</label>${seg('ocrLang', [['auto', 'Automatic'], ['hin', 'Hindi'], ['eng', 'English']], o.lang)}</div>
+    <div class="field"><label>Engine</label>${seg('ocrEng', [[3, 'Engine 3 (handwriting)'], [2, 'Engine 2']], o.engine)}</div>
+    <div class="row"><button class="btn" data-a="0">Cancel</button><button class="btn primary" data-a="1">Save settings</button></div>`,
+    (m, close) => m.addEventListener('click', e => {
+      const sb = e.target.closest('.seg button');
+      if (sb) { sb.parentNode.querySelectorAll('button').forEach(x => x.classList.toggle('on', x === sb)); return; }
+      const b = e.target.closest('[data-a]'); if (!b) return;
+      if (b.dataset.a === '1') {
+        S.set.ocr = {
+          key: m.querySelector('#ocrKey').value.trim() || 'helloworld',
+          lang: m.querySelector('#ocrLang .on').dataset.v,
+          engine: +m.querySelector('#ocrEng .on').dataset.v
+        };
+        saveSet(); toast('Settings saved');
+      }
+      close();
+    }));
+}
+$('#btnConvert').onclick = convertPage;
 
 /* ---------------- Open / close notebook ---------------- */
 async function openNotebook(id) {
@@ -847,7 +1072,7 @@ async function makeThumb() {
   ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height);
   if (p.bg.t === 'pdf') {
     if (S.pdfDoc) { const pg = await S.pdfDoc.getPage(p.bg.n); await pg.render({ canvasContext: ctx, viewport: pg.getViewport({ scale: r }) }).promise; }
-  } else drawTemplate(ctx, p, r);
+  } else { drawTemplate(ctx, p, r); drawTyped(ctx, p, r); }
   ctx.setTransform(r, 0, 0, r, 0, 0);
   for (const st of p.strokes) drawStroke(ctx, st);
   const url = c.toDataURL('image/jpeg', 0.72); c.width = c.height = 0;
@@ -998,7 +1223,8 @@ async function exportPdf() {
   if (!window.PDFLib) return toast(OFFLINE_LIB_MSG);
   busy('Making PDF…');
   try {
-    const { PDFDocument, LineCapStyle, LineJoinStyle } = PDFLib;
+    const { PDFDocument, LineCapStyle, StandardFonts } = PDFLib;
+    let helv = null;
     const out = await PDFDocument.create();
     let copied = new Map();
     if (S.nb.hasPdf) {
@@ -1031,6 +1257,30 @@ async function exportPdf() {
         const { L, D } = tplPrims(p.bg.t === 'tpl' ? p.bg.tpl : 'blank', p.w, p.h);
         for (const l of L) page.drawLine({ start: { x: l[0], y: p.h - l[1] }, end: { x: l[2], y: p.h - l[3] }, thickness: l[5], color: hexRgb(l[4]) });
         for (const d of D) page.drawCircle({ x: d[0], y: p.h - d[1], size: d[2], color: hexRgb(d[3]) });
+        if (p.typed && p.typed.length) {
+          await fontReady();
+          const { m, fit } = layoutTyped(p, p.typed);
+          const plain = /^[\x20-\x7E]*$/;
+          const latin = [], other = [];
+          fit.forEach((l, i) => { if (l.t) (plain.test(l.t) ? latin : other).push({ t: l.t, y: m.first + i * m.lh }); });
+          if (latin.length) {               // English: real, selectable PDF text
+            helv = helv || await out.embedFont(StandardFonts.Helvetica);
+            for (const l of latin) {
+              const maxW = m.right - m.x, size = Math.min(12.5, 12.5 * maxW / Math.max(1, helv.widthOfTextAtSize(l.t, 12.5)));
+              page.drawText(l.t, { x: m.x, y: p.h - l.y, size, font: helv, color: hexRgb(TYPE_COLOR) });
+            }
+          }
+          if (other.length) {               // Hindi: drawn as a picture so letters join correctly
+            const R = 3, c = document.createElement('canvas');
+            c.width = Math.round(p.w * R); c.height = Math.round(p.h * R);
+            const ctx = c.getContext('2d');
+            ctx.setTransform(R, 0, 0, R, 0, 0);
+            ctx.font = TYPE_SIZE + 'px ' + TYPE_FONT; ctx.fillStyle = TYPE_COLOR;
+            other.forEach(l => ctx.fillText(l.t, m.x, l.y));
+            const png = await out.embedPng(c.toDataURL('image/png')); c.width = c.height = 0;
+            page.drawImage(png, { x: 0, y: 0, width: p.w, height: p.h });
+          }
+        }
       }
       const map = mapper(rot, box.width, box.height);
       for (const st of p.strokes) {
@@ -1152,6 +1402,7 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
     document.body.classList.toggle('penonly', !!S.set.penOnly);
     renderLibrary();
+    fontReady().then(() => { if (S.nb) { S.pages.forEach(p => { p._rs = null; }); updateVisible(); } });
   } catch (e) {
     console.error(e);
     $('#grid').innerHTML = '<div class="empty"><strong>Storage is blocked</strong>This browser is not allowing Inkbook to save notes. Turn off private browsing, or open the app from the Home Screen icon.</div>';
